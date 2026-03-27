@@ -133,6 +133,15 @@ def profile_link_html(user_id: int, display_name: str, username: str | None) -> 
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
 
+def format_city(city_value: str | None) -> str:
+    city = (city_value or "").strip()
+    if not city:
+        return "Не указан"
+    if city.lower() in {"геолокация", "гео", "📍 гео"}:
+        return "По геолокации 📍"
+    return city
+
+
 def parse_start_payload(args) -> tuple[int | None, str | None]:
     if not args:
         return None, None
@@ -422,7 +431,8 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("У тебя пока нет анкеты. Нажми /start.")
         return
 
-    caption = f"🍻 {user[1]}, {user[2]}\n📍 {user[3]}\n\n{user[4]}"
+    city = format_city(user[3])
+    caption = f"🍻 {user[1]}, {user[2]}\n🏙 Город: {city}\n\n{user[4]}"
     await update.message.reply_photo(user[5], caption=caption, reply_markup=main_menu())
 
 
@@ -479,7 +489,8 @@ async def send_next_profile(message, context: ContextTypes.DEFAULT_TYPE, user_id
 
     context.user_data["target"] = target[0]
 
-    text = f"🍻 {target[1]}, {target[2]}\n📍 {target[3]}\n\n{target[4]}"
+    city = format_city(target[3])
+    text = f"🍻 {target[1]}, {target[2]}\n🏙 Город: {city}\n\n{target[4]}"
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("👎", callback_data="skip"), InlineKeyboardButton("❤️", callback_data="like")],
