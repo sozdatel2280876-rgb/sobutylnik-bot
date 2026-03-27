@@ -5,6 +5,7 @@ import random
 import re
 from datetime import datetime, timezone
 
+import httpx
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -85,6 +86,8 @@ FIRST_LIKE_BOOST_HOURS = _env_int("FIRST_LIKE_BOOST_HOURS", 24)
 REFERRAL_BOOST_HOURS = _env_int("REFERRAL_BOOST_HOURS", 24)
 PAID_BOOST_HOURS = _env_int("PAID_BOOST_HOURS", 24)
 PAID_BOOST_PRICE_XTR = _env_int("PAID_BOOST_PRICE_XTR", 50)
+GEO_LOOKUP_TIMEOUT = _env_int("GEO_LOOKUP_TIMEOUT", 6)
+GEO_USER_AGENT = os.getenv("GEO_USER_AGENT", "sobutylnik-bot/1.0 (telegram)")
 
 
 def age_keyboard() -> ReplyKeyboardMarkup:
@@ -137,9 +140,54 @@ def format_city(city_value: str | None) -> str:
     city = (city_value or "").strip()
     if not city:
         return "Не указан"
-    if city.lower() in {"геолокация", "гео", "📍 гео"}:
+    if city.lower() in {"геолокация", "гео", "📍 гео", "по геолокации", "по геолокации 📍"}:
         return "По геолокации 📍"
     return city
+
+
+def settlement_from_address(address: dict) -> str | None:
+    if not isinstance(address, dict):
+        return None
+
+    ordered_keys = [
+        ("city", "город"),
+        ("town", "город"),
+        ("village", "село"),
+        ("hamlet", "деревня"),
+        ("municipality", "поселение"),
+    ]
+
+    for key, kind in ordered_keys:
+        value = (address.get(key) or "").strip()
+        if value:
+            if kind == "город":
+                return value
+            return f"{value} ({kind})"
+
+    return None
+
+
+async def resolve_settlement_from_location(lat: float, lon: float) -> str | None:
+    url = "https://nominatim.openstreetmap.org/reverse"
+    params = {
+        "format": "jsonv2",
+        "lat": lat,
+        "lon": lon,
+        "zoom": 10,
+        "addressdetails": 1,
+        "accept-language": "ru",
+    }
+    headers = {"User-Agent": GEO_USER_AGENT}
+
+    try:
+        async with httpx.AsyncClient(timeout=GEO_LOOKUP_TIMEOUT) as client:
+            response = await client.get(url, params=params, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        return None
+
+    return settlement_from_address(payload.get("address", {}))
 
 
 def parse_start_payload(args) -> tuple[int | None, str | None]:
@@ -345,11 +393,23 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = update.message.location
     context.user_data["lat"] = loc.latitude
     context.user_data["lon"] = loc.longitude
-    context.user_data["city"] = "Геолокация"
+    settlement = await resolve_settlement_from_location(loc.latitude, loc.longitude)
+    context.user_data["city"] = settlement or "По геолокации 📍"
     context.user_data["about"] = "Ищу компанию и новые знакомства 🍻"
     context.user_data["step"] = "photo"
 
-    await update.message.reply_text("Отлично, локацию получил. Отправь фото профиля 📸")
+    if settlement:
+        await update.message.reply_text(
+            f"Отлично, локацию получил.\n"
+            f"Определил населенный пункт: {settlement}\n"
+            "Теперь отправь фото профиля 📸"
+        )
+    else:
+        await update.message.reply_text(
+            "Отлично, локацию получил.\n"
+            "Населенный пункт точно определить не удалось, но геолокацию сохранил.\n"
+            "Теперь отправь фото профиля 📸"
+        )
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
