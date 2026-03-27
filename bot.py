@@ -1,5 +1,6 @@
 ﻿import asyncio
 import html
+import os
 import random
 
 from telegram import (
@@ -20,7 +21,15 @@ from telegram.ext import (
 )
 
 import db
-from config import TOKEN
+try:
+    from config import TOKEN as LOCAL_TOKEN
+except Exception:
+    LOCAL_TOKEN = None
+
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or LOCAL_TOKEN
+
+if not TOKEN:
+    raise RuntimeError("Set BOT_TOKEN (or TOKEN) env var, or add TOKEN to config.py")
 
 
 db.init_db()
@@ -287,3 +296,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
