@@ -278,6 +278,31 @@ def init_db():
         """,
     )
 
+    _exec(
+        """
+        CREATE TABLE IF NOT EXISTS purchases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            product_code TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            currency TEXT NOT NULL,
+            charge_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        query_pg="""
+        CREATE TABLE IF NOT EXISTS purchases (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            product_code TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            currency TEXT NOT NULL,
+            charge_id TEXT NOT NULL UNIQUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    )
+
     if not IS_POSTGRES:
         _ensure_sqlite_schema_compat()
 
@@ -323,22 +348,36 @@ def get_user(user_id):
     )
 
 
-def set_boost_hours(user_id, hours=24):
+def add_boost_hours(user_id, hours=24):
     hours = int(hours)
+    delta = f"+{hours} hours"
     _exec(
         """
         UPDATE users
-        SET boost_until = datetime('now', ?)
+        SET boost_until = CASE
+            WHEN boost_until IS NOT NULL AND datetime(boost_until) > datetime('now')
+                THEN datetime(boost_until, ?)
+            ELSE datetime('now', ?)
+        END
         WHERE user_id = ?
         """,
-        (f"+{hours} hours", user_id),
+        (delta, delta, user_id),
         query_pg="""
         UPDATE users
-        SET boost_until = NOW() + (%s || ' hours')::INTERVAL
+        SET boost_until = CASE
+            WHEN boost_until IS NOT NULL AND boost_until > NOW()
+                THEN boost_until + CAST(%s AS INTERVAL)
+            ELSE NOW() + CAST(%s AS INTERVAL)
+        END
         WHERE user_id = %s
         """,
     )
     _commit_if_needed()
+
+
+def set_boost_hours(user_id, hours=24):
+    # Backward-compatible alias; currently we extend active boost.
+    add_boost_hours(user_id, hours)
 
 
 def has_reward(user_id, reward_type):
@@ -418,6 +457,50 @@ def get_referrals_count(referrer_id):
         query_pg="SELECT COUNT(*) FROM referrals WHERE referrer_id = %s",
     )
     return int(row[0] or 0)
+
+
+def record_purchase(user_id, product_code, amount, currency, charge_id):
+    existing = _fetchone(
+        "SELECT 1 FROM purchases WHERE charge_id = ?",
+        (charge_id,),
+        query_pg="SELECT 1 FROM purchases WHERE charge_id = %s",
+    )
+    if existing:
+        return False
+
+    _exec(
+        """
+        INSERT INTO purchases (user_id, product_code, amount, currency, charge_id, created_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """,
+        (user_id, product_code, int(amount), currency, charge_id),
+        query_pg="""
+        INSERT INTO purchases (user_id, product_code, amount, currency, charge_id, created_at)
+        VALUES (%s, %s, %s, %s, %s, NOW())
+        ON CONFLICT(charge_id) DO NOTHING
+        """,
+    )
+    _commit_if_needed()
+    return True
+
+
+def get_purchases_summary():
+    total_count = int(
+        _fetchone(
+            "SELECT COUNT(*) FROM purchases",
+            query_pg="SELECT COUNT(*) FROM purchases",
+        )[0]
+        or 0
+    )
+    xtr_total = int(
+        _fetchone(
+            "SELECT COALESCE(SUM(amount), 0) FROM purchases WHERE currency = ?",
+            ("XTR",),
+            query_pg="SELECT COALESCE(SUM(amount), 0) FROM purchases WHERE currency = %s",
+        )[0]
+        or 0
+    )
+    return {"purchases_total": total_count, "xtr_total": xtr_total}
 
 
 def is_banned(user_id):
@@ -846,6 +929,8 @@ def get_stats_snapshot():
             or 0
         )
 
+    purchases = get_purchases_summary()
+
     return {
         "users_total": users_total,
         "banned_total": banned_total,
@@ -856,6 +941,8 @@ def get_stats_snapshot():
         "matches_total": matches_total,
         "referrals_total": referrals_total,
         "boosts_active": boosts_active,
+        "purchases_total": purchases["purchases_total"],
+        "xtr_total": purchases["xtr_total"],
     }
 
 

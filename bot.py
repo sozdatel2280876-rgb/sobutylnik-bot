@@ -8,6 +8,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    LabeledPrice,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
@@ -18,6 +19,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -80,6 +82,8 @@ REMINDER_COOLDOWN_HOURS = _env_int("REMINDER_COOLDOWN_HOURS", 24)
 REMINDER_BATCH_SIZE = _env_int("REMINDER_BATCH_SIZE", 200)
 FIRST_LIKE_BOOST_HOURS = _env_int("FIRST_LIKE_BOOST_HOURS", 24)
 REFERRAL_BOOST_HOURS = _env_int("REFERRAL_BOOST_HOURS", 24)
+PAID_BOOST_HOURS = _env_int("PAID_BOOST_HOURS", 24)
+PAID_BOOST_PRICE_XTR = _env_int("PAID_BOOST_PRICE_XTR", 50)
 
 
 def age_keyboard() -> ReplyKeyboardMarkup:
@@ -103,7 +107,7 @@ def city_keyboard() -> ReplyKeyboardMarkup:
 
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["🔥 Смотреть анкеты"], ["👤 Профиль", "🔁 Заполнить заново"]],
+        [["🔥 Смотреть анкеты"], ["👤 Профиль", "💎 Буст 24ч"], ["🔁 Заполнить заново"]],
         resize_keyboard=True,
     )
 
@@ -236,6 +240,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "👤 Профиль":
         await show_profile(update, context)
+        return
+
+    if text == "💎 Буст 24ч":
+        await buy_boost(update, context)
         return
 
     if text == "🔥 Смотреть анкеты":
@@ -379,6 +387,34 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_photo(user[5], caption=caption, reply_markup=main_menu())
 
 
+async def send_boost_invoice(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    if not db.get_user(user_id):
+        await context.bot.send_message(chat_id=chat_id, text="Сначала создай анкету через /start")
+        return
+
+    payload = f"boost24:{user_id}:{int(datetime.now(timezone.utc).timestamp())}"
+    await context.bot.send_invoice(
+        chat_id=chat_id,
+        title=f"Буст анкеты +{PAID_BOOST_HOURS}ч",
+        description="Приоритетный показ твоей анкеты в подборе.",
+        payload=payload,
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(f"Буст +{PAID_BOOST_HOURS}ч", PAID_BOOST_PRICE_XTR)],
+        start_parameter="boost24",
+    )
+
+
+async def buy_boost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    if not await ensure_not_banned(update.message, update.effective_user.id):
+        return
+
+    await send_boost_invoice(update.effective_chat.id, update.effective_user.id, context)
+
+
 async def send_next_profile(message, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     if not await ensure_not_banned(message, user_id):
         return
@@ -493,6 +529,47 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_next_profile(query.message, context, user_id)
 
 
+async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    if not query:
+        return
+
+    payload = query.invoice_payload or ""
+    if query.currency != "XTR" or not payload.startswith("boost24:"):
+        await query.answer(ok=False, error_message="Платеж отклонен. Попробуй еще раз.")
+        return
+
+    await query.answer(ok=True)
+
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.successful_payment:
+        return
+
+    payment = update.message.successful_payment
+    payload = payment.invoice_payload or ""
+    if not payload.startswith("boost24:"):
+        return
+
+    user_id = update.effective_user.id
+    inserted = db.record_purchase(
+        user_id=user_id,
+        product_code="boost24",
+        amount=int(payment.total_amount),
+        currency=payment.currency,
+        charge_id=payment.telegram_payment_charge_id,
+    )
+
+    if inserted:
+        db.add_boost_hours(user_id, PAID_BOOST_HOURS)
+        await update.message.reply_text(
+            f"Оплата получена ✅\nТвой буст активирован на +{PAID_BOOST_HOURS}ч.",
+            reply_markup=main_menu(),
+        )
+    else:
+        await update.message.reply_text("Оплата уже обработана ✅", reply_markup=main_menu())
+
+
 async def relay_to_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -544,6 +621,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⛔ В бане: {stats['banned_total']}\n"
         f"🚀 Активных бустов: {stats['boosts_active']}\n"
         f"🤝 Рефералов всего: {stats['referrals_total']}\n"
+        f"💰 Покупок всего: {stats['purchases_total']}\n"
+        f"⭐ Продано Stars: {stats['xtr_total']}\n"
         f"🚫 Открытых жалоб: {stats['open_reports_total']}\n"
         f"❤️ Лайков за 24ч: {stats['likes_24h']}\n"
         f"👎 Дизлайков за 24ч: {stats['skips_24h']}\n"
@@ -695,12 +774,15 @@ def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("buy", buy_boost))
     app.add_handler(CommandHandler("myid", my_id))
     app.add_handler(CommandHandler("admin", admin_help))
     app.add_handler(CommandHandler("stats", admin_stats))
     app.add_handler(CommandHandler("reports", admin_reports))
     app.add_handler(CommandHandler("ban", admin_ban))
     app.add_handler(CommandHandler("unban", admin_unban))
+    app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(CallbackQueryHandler(buttons))
     app.add_handler(MessageHandler(filters.LOCATION, location_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
