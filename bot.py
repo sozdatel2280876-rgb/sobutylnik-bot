@@ -1,7 +1,8 @@
-﻿import asyncio
+import asyncio
 import html
 import os
 import random
+import re
 from datetime import datetime, timezone
 
 from telegram import (
@@ -107,7 +108,12 @@ def city_keyboard() -> ReplyKeyboardMarkup:
 
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["🔥 Смотреть анкеты"], ["👤 Профиль", "💎 Буст 24ч"], ["🔁 Заполнить заново"]],
+        [
+            ["🔥 Смотреть анкеты"],
+            ["👤 Профиль", "💎 Буст 24ч"],
+            ["🎁 Пригласить друзей"],
+            ["🔁 Заполнить заново"],
+        ],
         resize_keyboard=True,
     )
 
@@ -127,17 +133,28 @@ def profile_link_html(user_id: int, display_name: str, username: str | None) -> 
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
 
-def parse_referrer_from_args(args) -> int | None:
+def parse_start_payload(args) -> tuple[int | None, str | None]:
     if not args:
-        return None
+        return None, None
 
-    token = (args[0] or "").strip()
-    if token.startswith("ref_"):
-        token = token[4:]
+    token = (args[0] or "").strip().lower()
+    if not token:
+        return None, None
 
-    if token.isdigit():
-        return int(token)
-    return None
+    match = re.fullmatch(r"ref_(\d+)(?:_src_([a-z0-9_-]{2,32}))?", token)
+    if match:
+        referrer_id = int(match.group(1))
+        source = match.group(2)
+        return referrer_id, source
+
+    match = re.fullmatch(r"src_([a-z0-9_-]{2,32})", token)
+    if match:
+        return None, match.group(1)
+
+    if re.fullmatch(r"[a-z0-9_-]{2,32}", token):
+        return None, token
+
+    return None, None
 
 
 async def get_referral_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str | None:
@@ -149,6 +166,23 @@ async def get_referral_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) ->
     if not username:
         return None
     return f"https://t.me/{username}?start=ref_{user_id}"
+
+
+async def send_invite_block(message, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    referral_link = await get_referral_link(context, user_id)
+    if not referral_link:
+        await message.reply_text("Не смог сгенерировать ссылку. Попробуй позже.")
+        return
+
+    referrals_count = db.get_referrals_count(user_id)
+    await message.reply_text(
+        "🎁 Приглашай друзей и получай бонусный буст.\n"
+        f"Приглашено друзей: {referrals_count}\n\n"
+        "Твоя ссылка:\n"
+        f"{referral_link}\n\n"
+        "Готовый текст для отправки:\n"
+        "«Заходи, тут удобный подбор собеседников 🍻»"
+    )
 
 
 def is_boost_active_from_row(user_row) -> bool:
@@ -195,23 +229,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     existing_user = db.get_user(user_id)
-    referrer_id = parse_referrer_from_args(context.args)
+    referrer_id, source_tag = parse_start_payload(context.args)
+    if source_tag:
+        db.record_source_click(user_id, source_tag)
 
     if existing_user:
-        referral_link = await get_referral_link(context, user_id)
-        referrals_count = db.get_referrals_count(user_id)
-        text = "С возвращением! Выбирай, что делаем дальше 👇"
-        if referral_link:
-            text += (
-                "\n\nТвоя реферальная ссылка:\n"
-                f"{referral_link}\n"
-                f"Приглашено друзей: {referrals_count}"
-            )
-        await update.message.reply_text(text, reply_markup=main_menu())
+        await update.message.reply_text("С возвращением! Выбирай, что делаем дальше 👇", reply_markup=main_menu())
+        await send_invite_block(update.message, context, user_id)
         return
 
     context.user_data.clear()
     context.user_data["referrer_id"] = None
+    context.user_data["source_tag"] = source_tag
 
     if referrer_id and referrer_id != user_id and db.get_user(referrer_id):
         context.user_data["referrer_id"] = referrer_id
@@ -244,6 +273,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "💎 Буст 24ч":
         await buy_boost(update, context)
+        return
+
+    if text == "🎁 Пригласить друзей":
+        await send_invite_block(update.message, context, update.effective_user.id)
         return
 
     if text == "🔥 Смотреть анкеты":
@@ -343,6 +376,12 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if not was_existing:
+        source_tag = context.user_data.get("source_tag")
+        if not source_tag and context.user_data.get("referrer_id"):
+            source_tag = "referral"
+        if source_tag:
+            db.set_user_source(user_id, source_tag)
+
         referrer_id = context.user_data.get("referrer_id")
         if referrer_id and referrer_id != user_id and db.add_referral(referrer_id, user_id):
             db.set_boost_hours(user_id, REFERRAL_BOOST_HOURS)
@@ -593,6 +632,8 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Админ-команды:\n"
         "/stats — сводка по боту\n"
+        "/sources — источники трафика\n"
+        "/promo — готовые рекламные ссылки\n"
         "/reports — список открытых жалоб\n"
         "/ban <user_id> [причина] — заблокировать пользователя\n"
         "/unban <user_id> — снять блокировку\n"
@@ -630,6 +671,66 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔥 Всего мэтчей: {stats['matches_total']}"
     )
     await update.message.reply_text(text)
+
+
+async def admin_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещен.")
+        return
+
+    rows = db.get_source_stats(limit=15)
+    if not rows:
+        await update.message.reply_text("По источникам пока нет данных.")
+        return
+
+    lines = ["Источники трафика (клики -> регистрации):"]
+    for i, row in enumerate(rows, start=1):
+        source = row[0]
+        clicks = int(row[1] or 0)
+        regs = int(row[2] or 0)
+        conv = 0.0
+        if clicks > 0:
+            conv = (regs / clicks) * 100
+        lines.append(f"{i}. {source}: {clicks} -> {regs} ({conv:.1f}%)")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def promo_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещен.")
+        return
+
+    username = context.bot.username
+    if not username:
+        me = await context.bot.get_me()
+        username = me.username
+
+    if not username:
+        await update.message.reply_text("Не удалось определить username бота.")
+        return
+
+    links = {
+        "Telegram каналы": f"https://t.me/{username}?start=src_tg_channels",
+        "TikTok": f"https://t.me/{username}?start=src_tiktok",
+        "Instagram": f"https://t.me/{username}?start=src_instagram",
+        "VK": f"https://t.me/{username}?start=src_vk",
+        "Друзья/личка": f"https://t.me/{username}?start=src_friends",
+    }
+
+    lines = ["Готовые рекламные ссылки:"]
+    for name, link in links.items():
+        lines.append(f"• {name}: {link}")
+
+    lines.append("")
+    lines.append("Смотреть результат по источникам: /sources")
+    await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
 
 async def admin_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -778,6 +879,8 @@ def main():
     app.add_handler(CommandHandler("myid", my_id))
     app.add_handler(CommandHandler("admin", admin_help))
     app.add_handler(CommandHandler("stats", admin_stats))
+    app.add_handler(CommandHandler("sources", admin_sources))
+    app.add_handler(CommandHandler("promo", promo_links))
     app.add_handler(CommandHandler("reports", admin_reports))
     app.add_handler(CommandHandler("ban", admin_ban))
     app.add_handler(CommandHandler("unban", admin_unban))
@@ -807,4 +910,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

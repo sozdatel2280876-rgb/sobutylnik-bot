@@ -280,6 +280,42 @@ def init_db():
 
     _exec(
         """
+        CREATE TABLE IF NOT EXISTS source_clicks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        query_pg="""
+        CREATE TABLE IF NOT EXISTS source_clicks (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            source TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    )
+
+    _exec(
+        """
+        CREATE TABLE IF NOT EXISTS user_sources (
+            user_id INTEGER PRIMARY KEY,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        query_pg="""
+        CREATE TABLE IF NOT EXISTS user_sources (
+            user_id BIGINT PRIMARY KEY,
+            source TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    )
+
+    _exec(
+        """
         CREATE TABLE IF NOT EXISTS purchases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -457,6 +493,114 @@ def get_referrals_count(referrer_id):
         query_pg="SELECT COUNT(*) FROM referrals WHERE referrer_id = %s",
     )
     return int(row[0] or 0)
+
+
+def _clean_source(source):
+    if source is None:
+        return None
+
+    source = str(source).strip().lower()
+    if not source:
+        return None
+
+    allowed = []
+    for char in source:
+        if char.isalnum() or char in {"_", "-"}:
+            allowed.append(char)
+
+    cleaned = "".join(allowed)[:32]
+    return cleaned or None
+
+
+def record_source_click(user_id, source):
+    source = _clean_source(source)
+    if not source:
+        return False
+
+    _exec(
+        """
+        INSERT INTO source_clicks (user_id, source, created_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        """,
+        (user_id, source),
+        query_pg="""
+        INSERT INTO source_clicks (user_id, source, created_at)
+        VALUES (%s, %s, NOW())
+        """,
+    )
+    _commit_if_needed()
+    return True
+
+
+def set_user_source(user_id, source):
+    source = _clean_source(source)
+    if not source:
+        return False
+
+    _exec(
+        """
+        INSERT OR IGNORE INTO user_sources (user_id, source, created_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        """,
+        (user_id, source),
+        query_pg="""
+        INSERT INTO user_sources (user_id, source, created_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT(user_id) DO NOTHING
+        """,
+    )
+    _commit_if_needed()
+    return True
+
+
+def get_source_stats(limit=15):
+    limit = int(limit)
+    if IS_POSTGRES:
+        return _fetchall(
+            """
+            WITH clicks AS (
+                SELECT source, COUNT(DISTINCT user_id) AS clicks
+                FROM source_clicks
+                GROUP BY source
+            ),
+            regs AS (
+                SELECT source, COUNT(*) AS regs
+                FROM user_sources
+                GROUP BY source
+            )
+            SELECT
+                COALESCE(clicks.source, regs.source) AS source,
+                COALESCE(clicks.clicks, 0) AS clicks,
+                COALESCE(regs.regs, 0) AS regs
+            FROM clicks
+            FULL OUTER JOIN regs ON regs.source = clicks.source
+            ORDER BY regs DESC, clicks DESC, source ASC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+
+    return _fetchall(
+        """
+        SELECT
+            source,
+            SUM(clicks) AS clicks,
+            SUM(regs) AS regs
+        FROM (
+            SELECT source, COUNT(DISTINCT user_id) AS clicks, 0 AS regs
+            FROM source_clicks
+            GROUP BY source
+            UNION ALL
+            SELECT source, 0 AS clicks, COUNT(*) AS regs
+            FROM user_sources
+            GROUP BY source
+        ) t
+        GROUP BY source
+        ORDER BY regs DESC, clicks DESC, source ASC
+        LIMIT ?
+        """,
+        (limit,),
+    )
 
 
 def record_purchase(user_id, product_code, amount, currency, charge_id):
