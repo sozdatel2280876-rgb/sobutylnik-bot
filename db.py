@@ -64,6 +64,9 @@ def _ensure_sqlite_schema_compat():
         _exec("ALTER TABLE users ADD COLUMN created_at TEXT")
         _exec("UPDATE users SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
 
+    if not _sqlite_column_exists("users", "boost_until"):
+        _exec("ALTER TABLE users ADD COLUMN boost_until TEXT")
+
     if not _sqlite_column_exists("likes", "created_at"):
         _exec("ALTER TABLE likes ADD COLUMN created_at TEXT")
         _exec("UPDATE likes SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
@@ -87,7 +90,8 @@ def init_db():
             photo TEXT NOT NULL,
             lat REAL,
             lon REAL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            boost_until TEXT
         )
         """,
         query_pg="""
@@ -100,7 +104,8 @@ def init_db():
             photo TEXT NOT NULL,
             lat DOUBLE PRECISION,
             lon DOUBLE PRECISION,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            boost_until TIMESTAMPTZ
         )
         """,
     )
@@ -229,6 +234,50 @@ def init_db():
         """,
     )
 
+    _exec(
+        "SELECT 1",
+        query_pg="""
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS boost_until TIMESTAMPTZ
+        """,
+    )
+
+    _exec(
+        """
+        CREATE TABLE IF NOT EXISTS referrals (
+            referrer_id INTEGER NOT NULL,
+            invited_id INTEGER PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        query_pg="""
+        CREATE TABLE IF NOT EXISTS referrals (
+            referrer_id BIGINT NOT NULL,
+            invited_id BIGINT PRIMARY KEY,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    )
+
+    _exec(
+        """
+        CREATE TABLE IF NOT EXISTS user_rewards (
+            user_id INTEGER NOT NULL,
+            reward_type TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, reward_type)
+        )
+        """,
+        query_pg="""
+        CREATE TABLE IF NOT EXISTS user_rewards (
+            user_id BIGINT NOT NULL,
+            reward_type TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (user_id, reward_type)
+        )
+        """,
+    )
+
     if not IS_POSTGRES:
         _ensure_sqlite_schema_compat()
 
@@ -272,6 +321,103 @@ def get_user(user_id):
         (user_id,),
         query_pg="SELECT * FROM users WHERE user_id = %s",
     )
+
+
+def set_boost_hours(user_id, hours=24):
+    hours = int(hours)
+    _exec(
+        """
+        UPDATE users
+        SET boost_until = datetime('now', ?)
+        WHERE user_id = ?
+        """,
+        (f"+{hours} hours", user_id),
+        query_pg="""
+        UPDATE users
+        SET boost_until = NOW() + (%s || ' hours')::INTERVAL
+        WHERE user_id = %s
+        """,
+    )
+    _commit_if_needed()
+
+
+def has_reward(user_id, reward_type):
+    row = _fetchone(
+        """
+        SELECT 1 FROM user_rewards
+        WHERE user_id = ? AND reward_type = ?
+        """,
+        (user_id, reward_type),
+        query_pg="""
+        SELECT 1 FROM user_rewards
+        WHERE user_id = %s AND reward_type = %s
+        """,
+    )
+    return row is not None
+
+
+def grant_reward_once(user_id, reward_type):
+    if has_reward(user_id, reward_type):
+        return False
+    _exec(
+        """
+        INSERT INTO user_rewards (user_id, reward_type, created_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        """,
+        (user_id, reward_type),
+        query_pg="""
+        INSERT INTO user_rewards (user_id, reward_type, created_at)
+        VALUES (%s, %s, NOW())
+        """,
+    )
+    _commit_if_needed()
+    return True
+
+
+def count_likes_given(user_id):
+    row = _fetchone(
+        "SELECT COUNT(*) FROM likes WHERE user_from = ?",
+        (user_id,),
+        query_pg="SELECT COUNT(*) FROM likes WHERE user_from = %s",
+    )
+    return int(row[0] or 0)
+
+
+def add_referral(referrer_id, invited_id):
+    if referrer_id == invited_id:
+        return False
+    _exec(
+        """
+        INSERT OR IGNORE INTO referrals (referrer_id, invited_id, created_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        """,
+        (referrer_id, invited_id),
+        query_pg="""
+        INSERT INTO referrals (referrer_id, invited_id, created_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT(invited_id) DO NOTHING
+        """,
+    )
+    _commit_if_needed()
+    return get_referrer_id(invited_id) == referrer_id
+
+
+def get_referrer_id(invited_id):
+    row = _fetchone(
+        "SELECT referrer_id FROM referrals WHERE invited_id = ?",
+        (invited_id,),
+        query_pg="SELECT referrer_id FROM referrals WHERE invited_id = %s",
+    )
+    return int(row[0]) if row else None
+
+
+def get_referrals_count(referrer_id):
+    row = _fetchone(
+        "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?",
+        (referrer_id,),
+        query_pg="SELECT COUNT(*) FROM referrals WHERE referrer_id = %s",
+    )
+    return int(row[0] or 0)
 
 
 def is_banned(user_id):
@@ -676,6 +822,29 @@ def get_stats_snapshot():
         or 0
     )
     matches_total = match_rows // 2
+    referrals_total = int(
+        _fetchone(
+            "SELECT COUNT(*) FROM referrals",
+            query_pg="SELECT COUNT(*) FROM referrals",
+        )[0]
+        or 0
+    )
+
+    if IS_POSTGRES:
+        boosts_active = int(
+            _fetchone(
+                "SELECT COUNT(*) FROM users WHERE boost_until IS NOT NULL AND boost_until > NOW()",
+                query_pg="SELECT COUNT(*) FROM users WHERE boost_until IS NOT NULL AND boost_until > NOW()",
+            )[0]
+            or 0
+        )
+    else:
+        boosts_active = int(
+            _fetchone(
+                "SELECT COUNT(*) FROM users WHERE boost_until IS NOT NULL AND datetime(boost_until) > datetime('now')"
+            )[0]
+            or 0
+        )
 
     return {
         "users_total": users_total,
@@ -685,6 +854,8 @@ def get_stats_snapshot():
         "skips_24h": skips_24h,
         "reports_24h": reports_24h,
         "matches_total": matches_total,
+        "referrals_total": referrals_total,
+        "boosts_active": boosts_active,
     }
 
 

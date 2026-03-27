@@ -2,6 +2,7 @@
 import html
 import os
 import random
+from datetime import datetime, timezone
 
 from telegram import (
     InlineKeyboardButton,
@@ -77,6 +78,8 @@ def _env_int(name: str, default: int) -> int:
 INACTIVE_LIKE_DAYS = _env_int("INACTIVE_LIKE_DAYS", 3)
 REMINDER_COOLDOWN_HOURS = _env_int("REMINDER_COOLDOWN_HOURS", 24)
 REMINDER_BATCH_SIZE = _env_int("REMINDER_BATCH_SIZE", 200)
+FIRST_LIKE_BOOST_HOURS = _env_int("FIRST_LIKE_BOOST_HOURS", 24)
+REFERRAL_BOOST_HOURS = _env_int("REFERRAL_BOOST_HOURS", 24)
 
 
 def age_keyboard() -> ReplyKeyboardMarkup:
@@ -120,6 +123,53 @@ def profile_link_html(user_id: int, display_name: str, username: str | None) -> 
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
 
+def parse_referrer_from_args(args) -> int | None:
+    if not args:
+        return None
+
+    token = (args[0] or "").strip()
+    if token.startswith("ref_"):
+        token = token[4:]
+
+    if token.isdigit():
+        return int(token)
+    return None
+
+
+async def get_referral_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str | None:
+    username = context.bot.username
+    if not username:
+        me = await context.bot.get_me()
+        username = me.username
+
+    if not username:
+        return None
+    return f"https://t.me/{username}?start=ref_{user_id}"
+
+
+def is_boost_active_from_row(user_row) -> bool:
+    if not user_row or len(user_row) < 10:
+        return False
+
+    boost_until = user_row[9]
+    if not boost_until:
+        return False
+
+    if isinstance(boost_until, datetime):
+        dt = boost_until
+    else:
+        raw = str(boost_until).replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(raw)
+        except Exception:
+            return False
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt > datetime.now(timezone.utc)
+
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -135,13 +185,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    if not await ensure_not_banned(update.message, update.effective_user.id):
+    user_id = update.effective_user.id
+
+    if not await ensure_not_banned(update.message, user_id):
+        return
+
+    existing_user = db.get_user(user_id)
+    referrer_id = parse_referrer_from_args(context.args)
+
+    if existing_user:
+        referral_link = await get_referral_link(context, user_id)
+        referrals_count = db.get_referrals_count(user_id)
+        text = "С возвращением! Выбирай, что делаем дальше 👇"
+        if referral_link:
+            text += (
+                "\n\nТвоя реферальная ссылка:\n"
+                f"{referral_link}\n"
+                f"Приглашено друзей: {referrals_count}"
+            )
+        await update.message.reply_text(text, reply_markup=main_menu())
         return
 
     context.user_data.clear()
+    context.user_data["referrer_id"] = None
+
+    if referrer_id and referrer_id != user_id and db.get_user(referrer_id):
+        context.user_data["referrer_id"] = referrer_id
+
     context.user_data["step"] = "name"
     await update.message.reply_text(
-        "Привет! Давай создадим анкету. Как тебя зовут?",
+        "Привет! Давай создадим анкету. Как тебя зовут?\n\n"
+        "🎁 Бонус: за первый лайк ты получишь +24 часа буста анкеты.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -246,9 +320,11 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     about_text = context.user_data.get("about") or "Ищу компанию и новые знакомства 🍻"
+    user_id = update.effective_user.id
+    was_existing = db.get_user(user_id) is not None
 
     db.add_user(
-        update.effective_user.id,
+        user_id,
         context.user_data["name"],
         context.user_data["age"],
         context.user_data["city"],
@@ -258,8 +334,38 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.get("lon"),
     )
 
+    if not was_existing:
+        referrer_id = context.user_data.get("referrer_id")
+        if referrer_id and referrer_id != user_id and db.add_referral(referrer_id, user_id):
+            db.set_boost_hours(user_id, REFERRAL_BOOST_HOURS)
+            db.set_boost_hours(referrer_id, REFERRAL_BOOST_HOURS)
+            try:
+                await context.bot.send_message(
+                    chat_id=referrer_id,
+                    text=(
+                        "🎉 Друг зарегистрировался по твоей ссылке!\n"
+                        f"Ты получил +{REFERRAL_BOOST_HOURS}ч буста анкеты."
+                    ),
+                )
+            except Exception:
+                pass
+            await update.message.reply_text(
+                f"🎁 Ты пришел по реферальной ссылке и получил +{REFERRAL_BOOST_HOURS}ч буста!"
+            )
+
     context.user_data["step"] = None
     await update.message.reply_text("Анкета сохранена ✅", reply_markup=main_menu())
+
+    referral_link = await get_referral_link(context, user_id)
+    if referral_link:
+        await update.message.reply_text(
+            "🚀 Быстрый старт:\n"
+            "1) Ставь лайки и получай мэтчи\n"
+            "2) За первый лайк — бонус буст\n"
+            "3) Приглашай друзей по ссылке:\n"
+            f"{referral_link}"
+        )
+
     await send_next_profile(update.message, context, update.effective_user.id)
 
 
@@ -292,7 +398,9 @@ async def send_next_profile(message, context: ContextTypes.DEFAULT_TYPE, user_id
 
     city = (me[3] or "").lower().strip()
     same_city = [u for u in users if (u[3] or "").lower().strip() == city]
-    target = random.choice(same_city if same_city else users)
+    pool = same_city if same_city else users
+    boosted_pool = [u for u in pool if is_boost_active_from_row(u)]
+    target = random.choice(boosted_pool if boosted_pool else pool)
 
     context.user_data["target"] = target[0]
 
@@ -328,6 +436,13 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "like":
         is_new_like = not db.like_exists(user_id, target)
         db.add_like(user_id, target)
+
+        if is_new_like and db.count_likes_given(user_id) == 1:
+            if db.grant_reward_once(user_id, "first_like_bonus"):
+                db.set_boost_hours(user_id, FIRST_LIKE_BOOST_HOURS)
+                await query.message.reply_text(
+                    f"🎁 Бонус за первый лайк: +{FIRST_LIKE_BOOST_HOURS}ч буста анкеты!"
+                )
 
         if db.is_match(user_id, target):
             db.create_match(user_id, target)
@@ -427,6 +542,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Статистика бота:\n"
         f"👥 Пользователей: {stats['users_total']}\n"
         f"⛔ В бане: {stats['banned_total']}\n"
+        f"🚀 Активных бустов: {stats['boosts_active']}\n"
+        f"🤝 Рефералов всего: {stats['referrals_total']}\n"
         f"🚫 Открытых жалоб: {stats['open_reports_total']}\n"
         f"❤️ Лайков за 24ч: {stats['likes_24h']}\n"
         f"👎 Дизлайков за 24ч: {stats['skips_24h']}\n"
