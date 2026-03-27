@@ -489,6 +489,91 @@ def get_open_reports(limit=20):
     )
 
 
+def get_stats_snapshot():
+    users_total = int(
+        _fetchone(
+            "SELECT COUNT(*) FROM users",
+            query_pg="SELECT COUNT(*) FROM users",
+        )[0]
+        or 0
+    )
+    banned_total = int(
+        _fetchone(
+            "SELECT COUNT(*) FROM banned_users",
+            query_pg="SELECT COUNT(*) FROM banned_users",
+        )[0]
+        or 0
+    )
+    open_reports_total = int(
+        _fetchone(
+            "SELECT COUNT(*) FROM reports WHERE status = 'open'",
+            query_pg="SELECT COUNT(*) FROM reports WHERE status = 'open'",
+        )[0]
+        or 0
+    )
+
+    if IS_POSTGRES:
+        likes_24h = int(
+            _fetchone(
+                "SELECT COUNT(*) FROM likes WHERE created_at > NOW() - INTERVAL '1 day'",
+                query_pg="SELECT COUNT(*) FROM likes WHERE created_at > NOW() - INTERVAL '1 day'",
+            )[0]
+            or 0
+        )
+        skips_24h = int(
+            _fetchone(
+                "SELECT COUNT(*) FROM skips WHERE created_at > NOW() - INTERVAL '1 day'",
+                query_pg="SELECT COUNT(*) FROM skips WHERE created_at > NOW() - INTERVAL '1 day'",
+            )[0]
+            or 0
+        )
+        reports_24h = int(
+            _fetchone(
+                "SELECT COUNT(*) FROM reports WHERE created_at > NOW() - INTERVAL '1 day'",
+                query_pg="SELECT COUNT(*) FROM reports WHERE created_at > NOW() - INTERVAL '1 day'",
+            )[0]
+            or 0
+        )
+    else:
+        likes_24h = int(
+            _fetchone(
+                "SELECT COUNT(*) FROM likes WHERE datetime(created_at) > datetime('now', '-1 day')"
+            )[0]
+            or 0
+        )
+        skips_24h = int(
+            _fetchone(
+                "SELECT COUNT(*) FROM skips WHERE datetime(created_at) > datetime('now', '-1 day')"
+            )[0]
+            or 0
+        )
+        reports_24h = int(
+            _fetchone(
+                "SELECT COUNT(*) FROM reports WHERE datetime(created_at) > datetime('now', '-1 day')"
+            )[0]
+            or 0
+        )
+
+    match_rows = int(
+        _fetchone(
+            "SELECT COUNT(*) FROM matches",
+            query_pg="SELECT COUNT(*) FROM matches",
+        )[0]
+        or 0
+    )
+    matches_total = match_rows // 2
+
+    return {
+        "users_total": users_total,
+        "banned_total": banned_total,
+        "open_reports_total": open_reports_total,
+        "likes_24h": likes_24h,
+        "skips_24h": skips_24h,
+        "reports_24h": reports_24h,
+        "matches_total": matches_total,
+    }
+
+
 def is_match(user1, user2):
     row = _fetchone(
         "SELECT 1 FROM likes WHERE user_from = ? AND user_to = ?",

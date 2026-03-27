@@ -360,6 +360,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Админ-команды:\n"
+        "/stats — сводка по боту\n"
         "/reports — список открытых жалоб\n"
         "/ban <user_id> [причина] — заблокировать пользователя\n"
         "/unban <user_id> — снять блокировку\n"
@@ -371,6 +372,28 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     await update.message.reply_text(f"Твой Telegram ID: {update.effective_user.id}")
+
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Доступ запрещен.")
+        return
+
+    stats = db.get_stats_snapshot()
+    text = (
+        "Статистика бота:\n"
+        f"👥 Пользователей: {stats['users_total']}\n"
+        f"⛔ В бане: {stats['banned_total']}\n"
+        f"🚫 Открытых жалоб: {stats['open_reports_total']}\n"
+        f"❤️ Лайков за 24ч: {stats['likes_24h']}\n"
+        f"👎 Дизлайков за 24ч: {stats['skips_24h']}\n"
+        f"📝 Жалоб за 24ч: {stats['reports_24h']}\n"
+        f"🔥 Всего мэтчей: {stats['matches_total']}"
+    )
+    await update.message.reply_text(text)
 
 
 async def admin_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -489,6 +512,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", my_id))
     app.add_handler(CommandHandler("admin", admin_help))
+    app.add_handler(CommandHandler("stats", admin_stats))
     app.add_handler(CommandHandler("reports", admin_reports))
     app.add_handler(CommandHandler("ban", admin_ban))
     app.add_handler(CommandHandler("unban", admin_unban))
