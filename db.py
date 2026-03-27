@@ -53,13 +53,22 @@ def _commit_if_needed():
         conn.commit()
 
 
-def _ensure_likes_created_at_column_sqlite():
-    row_data = _fetchall("PRAGMA table_info(likes)")
-    columns = [row[1] for row in row_data]
-    if "created_at" not in columns:
+def _sqlite_column_exists(table_name, column_name):
+    rows = _fetchall(f"PRAGMA table_info({table_name})")
+    columns = [row[1] for row in rows]
+    return column_name in columns
+
+
+def _ensure_sqlite_schema_compat():
+    if not _sqlite_column_exists("likes", "created_at"):
         _exec("ALTER TABLE likes ADD COLUMN created_at TEXT")
         _exec("UPDATE likes SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
-        _commit_if_needed()
+
+    if not _sqlite_column_exists("skips", "created_at"):
+        _exec("ALTER TABLE skips ADD COLUMN created_at TEXT")
+        _exec("UPDATE skips SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
+
+    _commit_if_needed()
 
 
 def init_db():
@@ -109,9 +118,6 @@ def init_db():
         """,
     )
 
-    if not IS_POSTGRES:
-        _ensure_likes_created_at_column_sqlite()
-
     _exec(
         """
         CREATE TABLE IF NOT EXISTS matches (
@@ -147,6 +153,51 @@ def init_db():
         )
         """,
     )
+
+    _exec(
+        """
+        CREATE TABLE IF NOT EXISTS reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reporter_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        query_pg="""
+        CREATE TABLE IF NOT EXISTS reports (
+            id BIGSERIAL PRIMARY KEY,
+            reporter_id BIGINT NOT NULL,
+            target_id BIGINT NOT NULL,
+            reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    )
+
+    _exec(
+        """
+        CREATE TABLE IF NOT EXISTS banned_users (
+            user_id INTEGER PRIMARY KEY,
+            reason TEXT NOT NULL,
+            banned_by INTEGER,
+            banned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        query_pg="""
+        CREATE TABLE IF NOT EXISTS banned_users (
+            user_id BIGINT PRIMARY KEY,
+            reason TEXT NOT NULL,
+            banned_by BIGINT,
+            banned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    )
+
+    if not IS_POSTGRES:
+        _ensure_sqlite_schema_compat()
 
     _commit_if_needed()
 
@@ -190,6 +241,47 @@ def get_user(user_id):
     )
 
 
+def is_banned(user_id):
+    row = _fetchone(
+        "SELECT 1 FROM banned_users WHERE user_id = ?",
+        (user_id,),
+        query_pg="SELECT 1 FROM banned_users WHERE user_id = %s",
+    )
+    return row is not None
+
+
+def ban_user(user_id, banned_by, reason):
+    _exec(
+        """
+        INSERT INTO banned_users (user_id, reason, banned_by, banned_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            reason=excluded.reason,
+            banned_by=excluded.banned_by,
+            banned_at=CURRENT_TIMESTAMP
+        """,
+        (user_id, reason, banned_by),
+        query_pg="""
+        INSERT INTO banned_users (user_id, reason, banned_by, banned_at)
+        VALUES (%s, %s, %s, NOW())
+        ON CONFLICT(user_id) DO UPDATE SET
+            reason=excluded.reason,
+            banned_by=excluded.banned_by,
+            banned_at=NOW()
+        """,
+    )
+    _commit_if_needed()
+
+
+def unban_user(user_id):
+    _exec(
+        "DELETE FROM banned_users WHERE user_id = ?",
+        (user_id,),
+        query_pg="DELETE FROM banned_users WHERE user_id = %s",
+    )
+    _commit_if_needed()
+
+
 def get_search_candidates(user_id, like_cooldown_days=5, skip_cooldown_days=1):
     like_days = int(like_cooldown_days)
     skip_days = int(skip_cooldown_days)
@@ -200,6 +292,11 @@ def get_search_candidates(user_id, like_cooldown_days=5, skip_cooldown_days=1):
             SELECT u.*
             FROM users u
             WHERE u.user_id != %s
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM banned_users b
+                  WHERE b.user_id = u.user_id
+              )
               AND NOT EXISTS (
                   SELECT 1
                   FROM likes l
@@ -214,8 +311,15 @@ def get_search_candidates(user_id, like_cooldown_days=5, skip_cooldown_days=1):
                     AND s.user_to = u.user_id
                     AND s.created_at > NOW() - (%s || ' days')::INTERVAL
               )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM reports r
+                  WHERE r.reporter_id = %s
+                    AND r.target_id = u.user_id
+                    AND r.status = 'open'
+              )
             """,
-            (user_id, user_id, like_days, user_id, skip_days),
+            (user_id, user_id, like_days, user_id, skip_days, user_id),
         )
 
     return _fetchall(
@@ -223,6 +327,11 @@ def get_search_candidates(user_id, like_cooldown_days=5, skip_cooldown_days=1):
         SELECT u.*
         FROM users u
         WHERE u.user_id != ?
+          AND NOT EXISTS (
+              SELECT 1
+              FROM banned_users b
+              WHERE b.user_id = u.user_id
+          )
           AND NOT EXISTS (
               SELECT 1
               FROM likes l
@@ -237,8 +346,15 @@ def get_search_candidates(user_id, like_cooldown_days=5, skip_cooldown_days=1):
                 AND s.user_to = u.user_id
                 AND datetime(s.created_at) > datetime('now', ?)
           )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM reports r
+              WHERE r.reporter_id = ?
+                AND r.target_id = u.user_id
+                AND r.status = 'open'
+          )
         """,
-        (user_id, user_id, f"-{like_days} days", user_id, f"-{skip_days} days"),
+        (user_id, user_id, f"-{like_days} days", user_id, f"-{skip_days} days", user_id),
     )
 
 
@@ -278,6 +394,99 @@ def add_skip(user_from, user_to):
         """,
     )
     _commit_if_needed()
+
+
+def add_report(reporter_id, target_id, reason):
+    existing = _fetchone(
+        """
+        SELECT id
+        FROM reports
+        WHERE reporter_id = ? AND target_id = ? AND status = 'open'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (reporter_id, target_id),
+        query_pg="""
+        SELECT id
+        FROM reports
+        WHERE reporter_id = %s AND target_id = %s AND status = 'open'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+    )
+
+    if existing:
+        report_id = existing[0]
+        _exec(
+            """
+            UPDATE reports
+            SET reason = ?, created_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (reason, report_id),
+            query_pg="""
+            UPDATE reports
+            SET reason = %s, created_at = NOW()
+            WHERE id = %s
+            """,
+        )
+    else:
+        _exec(
+            """
+            INSERT INTO reports (reporter_id, target_id, reason, status, created_at)
+            VALUES (?, ?, ?, 'open', CURRENT_TIMESTAMP)
+            """,
+            (reporter_id, target_id, reason),
+            query_pg="""
+            INSERT INTO reports (reporter_id, target_id, reason, status, created_at)
+            VALUES (%s, %s, %s, 'open', NOW())
+            """,
+        )
+    _commit_if_needed()
+
+
+def resolve_reports_for_user(target_id):
+    _exec(
+        """
+        UPDATE reports
+        SET status = 'resolved'
+        WHERE target_id = ? AND status = 'open'
+        """,
+        (target_id,),
+        query_pg="""
+        UPDATE reports
+        SET status = 'resolved'
+        WHERE target_id = %s AND status = 'open'
+        """,
+    )
+    _commit_if_needed()
+
+
+def get_open_reports(limit=20):
+    if IS_POSTGRES:
+        return _fetchall(
+            """
+            SELECT target_id, COUNT(*) AS reports_count, MAX(created_at) AS last_report_at
+            FROM reports
+            WHERE status = 'open'
+            GROUP BY target_id
+            ORDER BY reports_count DESC, last_report_at DESC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+
+    return _fetchall(
+        """
+        SELECT target_id, COUNT(*) AS reports_count, MAX(created_at) AS last_report_at
+        FROM reports
+        WHERE status = 'open'
+        GROUP BY target_id
+        ORDER BY reports_count DESC, last_report_at DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    )
 
 
 def is_match(user1, user2):
