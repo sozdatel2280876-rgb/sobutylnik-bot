@@ -326,7 +326,9 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "like":
+        is_new_like = not db.like_exists(user_id, target)
         db.add_like(user_id, target)
+
         if db.is_match(user_id, target):
             db.create_match(user_id, target)
 
@@ -357,6 +359,15 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
+        elif is_new_like:
+            try:
+                await context.bot.send_message(
+                    chat_id=target,
+                    text="Тебе поставили лайк ❤️\nЗайди в бот и посмотри новые анкеты.",
+                    reply_markup=main_menu(),
+                )
+            except Exception:
+                pass
     elif query.data == "skip":
         db.add_skip(user_id, target)
     elif query.data == "report":

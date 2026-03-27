@@ -391,6 +391,15 @@ def get_search_candidates(user_id, like_cooldown_days=5, skip_cooldown_days=1):
     )
 
 
+def like_exists(user_from, user_to):
+    row = _fetchone(
+        "SELECT 1 FROM likes WHERE user_from = ? AND user_to = ?",
+        (user_from, user_to),
+        query_pg="SELECT 1 FROM likes WHERE user_from = %s AND user_to = %s",
+    )
+    return row is not None
+
+
 def add_like(user_from, user_to):
     _exec(
         """
