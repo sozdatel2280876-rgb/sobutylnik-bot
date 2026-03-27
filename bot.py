@@ -105,6 +105,12 @@ def main_menu() -> ReplyKeyboardMarkup:
     )
 
 
+def reminder_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("👀 Показать анкеты", callback_data="show_profiles")]]
+    )
+
+
 def profile_link_html(user_id: int, display_name: str, username: str | None) -> str:
     if username:
         safe_username = html.escape(username)
@@ -310,6 +316,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_not_banned(query.message, user_id):
         return
 
+    if query.data == "show_profiles":
+        await send_next_profile(query.message, context, user_id)
+        return
+
     target = context.user_data.get("target")
     if not target:
         await query.message.reply_text("Анкета не найдена, нажми '🔥 Смотреть анкеты'.")
@@ -505,13 +515,18 @@ async def inactive_like_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     for row in rows:
         user_id = int(row[0])
         try:
+            user = db.get_user(user_id)
+            name = "друг"
+            if user and user[1]:
+                name = user[1]
+
             await context.bot.send_message(
                 chat_id=user_id,
                 text=(
-                    "👋 Давно не заходил в подбор.\n"
-                    "Нажми «🔥 Смотреть анкеты» и попробуй найти новое знакомство."
+                    f"👋 {name}, давно тебя не было в подборе.\n"
+                    "Нажми кнопку ниже и посмотри новые анкеты."
                 ),
-                reply_markup=main_menu(),
+                reply_markup=reminder_inline_keyboard(),
             )
             db.mark_reminder_sent(user_id, "inactive_like")
         except Exception:
