@@ -281,6 +281,36 @@ async def relay_to_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("После мэтча общайтесь в личке по ссылке, которую бот прислал.")
 
 
+def run_webhook_if_configured(app) -> bool:
+    webhook_base_url = os.getenv("WEBHOOK_BASE_URL")
+    render_host = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+
+    if not webhook_base_url and render_host:
+        webhook_base_url = f"https://{render_host}"
+
+    if not webhook_base_url:
+        return False
+
+    webhook_path = os.getenv("WEBHOOK_PATH", "/telegram")
+    if not webhook_path.startswith("/"):
+        webhook_path = f"/{webhook_path}"
+
+    webhook_url = f"{webhook_base_url.rstrip('/')}{webhook_path}"
+    webhook_secret = os.getenv("WEBHOOK_SECRET") or None
+    port = int(os.getenv("PORT", "10000"))
+
+    print(f"Bot started in webhook mode: {webhook_url}")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=webhook_path.lstrip("/"),
+        webhook_url=webhook_url,
+        secret_token=webhook_secret,
+        drop_pending_updates=True,
+    )
+    return True
+
+
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -290,7 +320,10 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    print("Bot started")
+    if run_webhook_if_configured(app):
+        return
+
+    print("Bot started in polling mode")
     app.run_polling(drop_pending_updates=True)
 
 
