@@ -64,6 +64,21 @@ def _parse_admin_ids() -> set[int]:
 ADMIN_IDS = _parse_admin_ids()
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+INACTIVE_LIKE_DAYS = _env_int("INACTIVE_LIKE_DAYS", 3)
+REMINDER_COOLDOWN_HOURS = _env_int("REMINDER_COOLDOWN_HOURS", 24)
+REMINDER_BATCH_SIZE = _env_int("REMINDER_BATCH_SIZE", 200)
+
+
 def age_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [["18", "19", "20"], ["21", "22", "23"], ["24", "25"], ["26+"]],
@@ -169,8 +184,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["city"] = text
         context.user_data["lat"] = None
         context.user_data["lon"] = None
-        context.user_data["step"] = "about"
-        await update.message.reply_text("Коротко о себе?")
+        context.user_data["about"] = "Ищу компанию и новые знакомства 🍻"
+        context.user_data["step"] = "photo"
+        await update.message.reply_text("Отправь фото профиля 📸")
         return
 
     if step == "about":
@@ -200,9 +216,10 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["lat"] = loc.latitude
     context.user_data["lon"] = loc.longitude
     context.user_data["city"] = "Геолокация"
-    context.user_data["step"] = "about"
+    context.user_data["about"] = "Ищу компанию и новые знакомства 🍻"
+    context.user_data["step"] = "photo"
 
-    await update.message.reply_text("Отлично, локацию получил. Коротко о себе?")
+    await update.message.reply_text("Отлично, локацию получил. Отправь фото профиля 📸")
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -217,17 +234,19 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     photo = update.message.photo[-1].file_id
 
-    required = ["name", "age", "city", "about"]
+    required = ["name", "age", "city"]
     if not all(k in context.user_data for k in required):
         await update.message.reply_text("Что-то сбилось. Нажми /start и пройди регистрацию заново.")
         return
+
+    about_text = context.user_data.get("about") or "Ищу компанию и новые знакомства 🍻"
 
     db.add_user(
         update.effective_user.id,
         context.user_data["name"],
         context.user_data["age"],
         context.user_data["city"],
-        context.user_data["about"],
+        about_text,
         photo,
         context.user_data.get("lat"),
         context.user_data.get("lon"),
@@ -476,6 +495,29 @@ async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+async def inactive_like_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    rows = db.get_inactive_users_for_like_reminder(
+        days=INACTIVE_LIKE_DAYS,
+        remind_cooldown_hours=REMINDER_COOLDOWN_HOURS,
+        limit=REMINDER_BATCH_SIZE,
+    )
+
+    for row in rows:
+        user_id = int(row[0])
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "👋 Давно не заходил в подбор.\n"
+                    "Нажми «🔥 Смотреть анкеты» и попробуй найти новое знакомство."
+                ),
+                reply_markup=main_menu(),
+            )
+            db.mark_reminder_sent(user_id, "inactive_like")
+        except Exception:
+            pass
+
+
 def run_webhook_if_configured(app) -> bool:
     webhook_base_url = os.getenv("WEBHOOK_BASE_URL")
     render_host = os.getenv("RENDER_EXTERNAL_HOSTNAME")
@@ -520,6 +562,16 @@ def main():
     app.add_handler(MessageHandler(filters.LOCATION, location_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
+    if app.job_queue:
+        app.job_queue.run_repeating(
+            inactive_like_reminder_job,
+            interval=6 * 60 * 60,
+            first=5 * 60,
+            name="inactive_like_reminder",
+        )
+    else:
+        print("Job queue is unavailable. Install APScheduler to enable reminders.")
 
     if run_webhook_if_configured(app):
         return

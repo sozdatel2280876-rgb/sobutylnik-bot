@@ -60,6 +60,10 @@ def _sqlite_column_exists(table_name, column_name):
 
 
 def _ensure_sqlite_schema_compat():
+    if not _sqlite_column_exists("users", "created_at"):
+        _exec("ALTER TABLE users ADD COLUMN created_at TEXT")
+        _exec("UPDATE users SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
+
     if not _sqlite_column_exists("likes", "created_at"):
         _exec("ALTER TABLE likes ADD COLUMN created_at TEXT")
         _exec("UPDATE likes SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
@@ -82,7 +86,8 @@ def init_db():
             about TEXT NOT NULL,
             photo TEXT NOT NULL,
             lat REAL,
-            lon REAL
+            lon REAL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """,
         query_pg="""
@@ -94,7 +99,8 @@ def init_db():
             about TEXT NOT NULL,
             photo TEXT NOT NULL,
             lat DOUBLE PRECISION,
-            lon DOUBLE PRECISION
+            lon DOUBLE PRECISION,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """,
     )
@@ -193,6 +199,33 @@ def init_db():
             banned_by BIGINT,
             banned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
+        """,
+    )
+
+    _exec(
+        """
+        CREATE TABLE IF NOT EXISTS reminders (
+            user_id INTEGER NOT NULL,
+            reminder_type TEXT NOT NULL,
+            sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, reminder_type)
+        )
+        """,
+        query_pg="""
+        CREATE TABLE IF NOT EXISTS reminders (
+            user_id BIGINT NOT NULL,
+            reminder_type TEXT NOT NULL,
+            sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (user_id, reminder_type)
+        )
+        """,
+    )
+
+    _exec(
+        "SELECT 1",
+        query_pg="""
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         """,
     )
 
@@ -487,6 +520,78 @@ def get_open_reports(limit=20):
         """,
         (int(limit),),
     )
+
+
+def get_inactive_users_for_like_reminder(days=3, remind_cooldown_hours=24, limit=200):
+    days = int(days)
+    remind_cooldown_hours = int(remind_cooldown_hours)
+    limit = int(limit)
+
+    if IS_POSTGRES:
+        return _fetchall(
+            """
+            SELECT u.user_id
+            FROM users u
+            WHERE NOT EXISTS (
+                SELECT 1 FROM banned_users b WHERE b.user_id = u.user_id
+            )
+              AND COALESCE(
+                    (SELECT MAX(l.created_at) FROM likes l WHERE l.user_from = u.user_id),
+                    u.created_at
+                  ) <= NOW() - (%s || ' days')::INTERVAL
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM reminders r
+                    WHERE r.user_id = u.user_id
+                      AND r.reminder_type = 'inactive_like'
+                      AND r.sent_at > NOW() - (%s || ' hours')::INTERVAL
+              )
+            LIMIT %s
+            """,
+            (days, remind_cooldown_hours, limit),
+        )
+
+    return _fetchall(
+        """
+        SELECT u.user_id
+        FROM users u
+        WHERE NOT EXISTS (
+            SELECT 1 FROM banned_users b WHERE b.user_id = u.user_id
+        )
+          AND COALESCE(
+                (SELECT MAX(datetime(l.created_at)) FROM likes l WHERE l.user_from = u.user_id),
+                datetime(u.created_at)
+              ) <= datetime('now', ?)
+          AND NOT EXISTS (
+                SELECT 1
+                FROM reminders r
+                WHERE r.user_id = u.user_id
+                  AND r.reminder_type = 'inactive_like'
+                  AND datetime(r.sent_at) > datetime('now', ?)
+          )
+        LIMIT ?
+        """,
+        (f"-{days} days", f"-{remind_cooldown_hours} hours", limit),
+    )
+
+
+def mark_reminder_sent(user_id, reminder_type="inactive_like"):
+    _exec(
+        """
+        INSERT INTO reminders (user_id, reminder_type, sent_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id, reminder_type)
+        DO UPDATE SET sent_at = CURRENT_TIMESTAMP
+        """,
+        (user_id, reminder_type),
+        query_pg="""
+        INSERT INTO reminders (user_id, reminder_type, sent_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT(user_id, reminder_type)
+        DO UPDATE SET sent_at = NOW()
+        """,
+    )
+    _commit_if_needed()
 
 
 def get_stats_snapshot():
